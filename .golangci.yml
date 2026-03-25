@@ -1,0 +1,83 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+
+linters:
+  default: none
+  enable:
+    # Bug detection
+    - errcheck
+    - errorlint
+    - govet
+    - staticcheck
+    - ineffassign
+    - bodyclose
+    - durationcheck
+    - nilerr
+    - copyloopvar
+
+    # Security
+    - gosec
+
+    # Style & consistency
+    - misspell
+    - unconvert
+    - whitespace
+
+    # Declaration ordering
+    - decorder
+
+    # Complexity
+    - gocyclo
+    - nestif
+
+  settings:
+    gocyclo:
+      min-complexity: 20
+    nestif:
+      min-complexity: 6
+    errcheck:
+      check-type-assertions: true
+    gosec:
+      excludes:
+        # Fires on idiomatic size conversions and protocol decodes. Drop for
+        # crypto/auth-critical code where the noise cost is worth paying.
+        - G115
+    decorder:
+      dec-order: type,const,var,func
+      disable-dec-order-check: false
+      disable-init-func-first-check: false
+      disable-dec-num-check: true # allow multiple const/var blocks (grouped by concern)
+      ignore-underscore-vars: true
+    govet:
+      enable-all: true
+      disable:
+        # Struct-layout micro-optimization; change with profile evidence.
+        - fieldalignment
+        # Fires on idiomatic `if err := ...; err != nil`; noise > signal.
+        - shadow
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+        path: _test\.go
+      - linters:
+          - gocyclo
+        path: _test\.go
+      - linters:
+          - gosec
+        path: _test\.go
+        text: "G306"
