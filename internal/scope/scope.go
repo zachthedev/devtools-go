@@ -70,12 +70,17 @@ func PackageDirs(patterns []string) []string {
 // Matching and filtering
 // ///////////////////////////////////////////////
 
-// Matcher returns a predicate reporting whether an allowlist-style entry
-// (either a full "kind file message" line or just a file path) falls
-// within any of the given package directories. An empty list or one
+// Matcher returns a predicate reporting whether a repo-relative file path
+// falls within any of the given package directories. An empty list or one
 // containing the repo root matches everything, so unscoped invocations
 // keep their existing behavior.
-func Matcher(pkgDirs []string) func(entry string) bool {
+//
+// It takes a path rather than a whole allow-file line, because which field
+// of a line holds the path is the tool's business and not this package's:
+// testpair writes "kind path detail" and deadcode writes "path func". A
+// predicate that guessed would answer no for one of them, and a wrong no
+// reads as an entry out of scope rather than as a line it failed to parse.
+func Matcher(pkgDirs []string) func(path string) bool {
 	if len(pkgDirs) == 0 {
 		return func(string) bool { return true }
 	}
@@ -88,14 +93,10 @@ func Matcher(pkgDirs []string) func(entry string) bool {
 	for _, d := range pkgDirs {
 		normalized = append(normalized, filepath.ToSlash(d))
 	}
-	return func(entry string) bool {
-		file := entry
-		if parts := strings.SplitN(entry, " ", 3); len(parts) >= 2 {
-			file = parts[1]
-		}
-		file = filepath.ToSlash(file)
+	return func(path string) bool {
+		path = filepath.ToSlash(path)
 		for _, d := range normalized {
-			if file == d || strings.HasPrefix(file, d+"/") {
+			if path == d || strings.HasPrefix(path, d+"/") {
 				return true
 			}
 		}
@@ -103,15 +104,16 @@ func Matcher(pkgDirs []string) func(entry string) bool {
 	}
 }
 
-// Filter returns items whose String() form the keep predicate accepts.
-// A nil predicate returns the input slice unchanged.
-func Filter[T fmt.Stringer](items []T, keep func(string) bool) []T {
+// Filter returns items whose path the keep predicate accepts. path reports
+// where an item's file path is; keep decides whether it is in scope. A nil
+// predicate returns the input slice unchanged.
+func Filter[T any](items []T, path func(T) string, keep func(string) bool) []T {
 	if keep == nil {
 		return items
 	}
 	filtered := make([]T, 0, len(items))
 	for _, item := range items {
-		if keep(item.String()) {
+		if keep(path(item)) {
 			filtered = append(filtered, item)
 		}
 	}

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"zach.tools/go/devtools/internal/scope"
 )
 
 // ///////////////////////////////////////////////
@@ -195,5 +197,35 @@ func TestGhost(t *testing.T) {}
 	}
 	if !strings.Contains(issues[0].Message, "Ghost") {
 		t.Errorf("expected message mentioning Ghost, got %+v", issues[0])
+	}
+}
+
+// ///////////////////////////////////////////////
+// allowPath
+// ///////////////////////////////////////////////
+
+func TestAllowPath_ResolvesAnIssueToAPathScopeMatchingAccepts(t *testing.T) {
+	// The round trip the accessor exists for. An issue's own canonical line
+	// has to resolve to a path a scope matcher accepts, or every entry
+	// filters out of scope and the tool rejects the allow file it wrote.
+	issue := Issue{
+		Kind:    "missing-test",
+		File:    "internal/foo/bar.go",
+		Message: "expected internal/foo/bar_test.go",
+	}
+
+	if got, want := allowPath(issue.String()), "internal/foo/bar.go"; got != want {
+		t.Errorf("allowPath(%q) = %q, want %q", issue.String(), got, want)
+	}
+	if !scope.Matcher([]string{"internal/foo"})(allowPath(issue.String())) {
+		t.Error("a scoped run drops an entry that is inside its own scope")
+	}
+}
+
+func TestAllowPath_AnswersWithWhatALineTooShortToSplitHolds(t *testing.T) {
+	// A hand-edited allow file is ordinary. A line with no second field has
+	// no path to give, and answering empty would match every scope.
+	if got, want := allowPath("missing-test"), "missing-test"; got != want {
+		t.Errorf("allowPath = %q, want %q", got, want)
 	}
 }

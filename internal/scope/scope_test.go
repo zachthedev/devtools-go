@@ -2,6 +2,7 @@ package scope
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -56,14 +57,20 @@ func TestMatcher_ScopedPaths(t *testing.T) {
 	}
 }
 
-func TestMatcher_ExtractsFilePathFromEntryLine(t *testing.T) {
+func TestMatcher_JudgesThePathItIsGivenAndParsesNothing(t *testing.T) {
+	// Matcher judges a path, and taking a line apart is the caller's job.
+	// The two tools hold their paths in different fields, so a matcher that
+	// dug one out itself would answer no for whichever shape it did not
+	// expect. A wrong no reads as an entry out of scope rather than as a
+	// line nothing could parse, which is how an allow list goes quietly
+	// unread.
 	m := Matcher([]string{"internal/foo"})
-	// Allow-list line form: "kind file message"
-	if !m("missing-test internal/foo/bar.go expected internal/foo/bar_test.go") {
-		t.Error("Matcher should extract file from 'kind file message' triple")
+
+	if !m("internal/foo/bar.go") {
+		t.Error("Matcher rejected a path inside the scope")
 	}
-	if m("missing-test internal/other/bar.go expected internal/other/bar_test.go") {
-		t.Error("Matcher should reject file outside scope")
+	if m("missing-test internal/foo/bar.go expected internal/foo/bar_test.go") {
+		t.Error("Matcher accepted a whole allow-file line, want it to judge paths only")
 	}
 }
 
@@ -81,7 +88,7 @@ func TestMatcher_ForwardSlashNormalization(t *testing.T) {
 
 func TestFilter_NilPredicatePassthrough(t *testing.T) {
 	items := []stringID{"a", "b"}
-	got := Filter(items, nil)
+	got := Filter(items, stringID.String, nil)
 	if len(got) != 2 {
 		t.Errorf("Filter(nil) dropped items: got %d, want 2", len(got))
 	}
@@ -89,7 +96,7 @@ func TestFilter_NilPredicatePassthrough(t *testing.T) {
 
 func TestFilter_PredicateFilters(t *testing.T) {
 	items := []stringID{"keep-1", "drop", "keep-2"}
-	got := Filter(items, func(s string) bool { return len(s) > 4 })
+	got := Filter(items, stringID.String, func(s string) bool { return len(s) > 4 })
 	if len(got) != 2 {
 		t.Fatalf("Filter len = %d, want 2", len(got))
 	}
@@ -99,8 +106,27 @@ func TestFilter_PredicateFilters(t *testing.T) {
 }
 
 func TestFilter_EmptyInput(t *testing.T) {
-	got := Filter[stringID](nil, func(string) bool { return true })
+	got := Filter[stringID](nil, stringID.String, func(string) bool { return true })
 	if len(got) != 0 {
 		t.Errorf("Filter(nil, _) len = %d, want 0", len(got))
+	}
+}
+
+func TestFilter_AsksTheAccessorRatherThanTheItemsText(t *testing.T) {
+	// The accessor is what decouples scope resolution from an allow file's
+	// line format. A Filter that read the item's own text instead would put
+	// the format back in the matcher's way.
+	items := []stringID{"unreachable internal/foo/a.go Fn", "unreachable internal/bar/b.go Fn"}
+	paths := func(s stringID) string {
+		fields := strings.Fields(string(s))
+		return fields[1]
+	}
+
+	got := Filter(items, paths, Matcher([]string{"internal/foo"}))
+	if len(got) != 1 {
+		t.Fatalf("Filter len = %d, want 1", len(got))
+	}
+	if got[0] != items[0] {
+		t.Errorf("Filter kept %q, want %q", got[0], items[0])
 	}
 }

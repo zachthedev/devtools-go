@@ -68,6 +68,12 @@ type Tool[T fmt.Stringer] struct {
 	// ToFinding converts a domain entry into the unified [report.Finding]
 	// shape used by text output.
 	ToFinding func(T) report.Finding
+	// AllowPath reports the repo-relative file path inside one allow-file
+	// line, which is what scope resolution narrows on. Each tool states it
+	// because each writes a different line: testpair "kind path detail",
+	// deadcode "path func". A tool that leaves this nil resolves every
+	// entry as the repo root, which is in scope for any pattern.
+	AllowPath func(line string) string
 }
 
 // Options captures parsed CLI flags affecting presentation.
@@ -127,6 +133,24 @@ func (t *Tool[T]) RunUpdate(patterns []string) {
 	report.PrintUpdated(os.Stderr, len(actual), t.AllowFile)
 }
 
+// allowPath reports the file path in one allow-file line, defaulting to
+// the repo root for a tool that named no accessor. The root is in scope for
+// every pattern, so a tool that says nothing keeps its entries rather than
+// having them silently filtered away.
+func (t *Tool[T]) allowPath(line string) string {
+	if t.AllowPath == nil {
+		return "."
+	}
+	return t.AllowPath(line)
+}
+
+// lineInScope returns a predicate reporting whether one allow-file line
+// falls within the patterns.
+func (t *Tool[T]) lineInScope(patterns []string) func(line string) bool {
+	inScope := scope.Matcher(scope.PackageDirs(patterns))
+	return func(line string) bool { return inScope(t.allowPath(line)) }
+}
+
 // RunValidate checks the allow file's categorization without scanning
 // the repository. Fast and side-effect-free; useful for pre-commit hooks.
 func (t *Tool[T]) RunValidate(patterns []string) {
@@ -140,8 +164,7 @@ func (t *Tool[T]) RunValidate(patterns []string) {
 		return
 	}
 
-	inScope := scope.Matcher(scope.PackageDirs(patterns))
-	uncat, err := allowlist.Validate(t.AllowFile, inScope)
+	uncat, err := allowlist.Validate(t.AllowFile, t.lineInScope(patterns))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -163,7 +186,7 @@ func (t *Tool[T]) RunCheck(patterns []string, opts Options) {
 		// Otherwise fall through with an empty allow list.
 	}
 
-	inScope := scope.Matcher(scope.PackageDirs(patterns))
+	inScope := t.lineInScope(patterns)
 
 	if _, err := os.Stat(t.AllowFile); err == nil {
 		uncat, vErr := allowlist.Validate(t.AllowFile, inScope)
@@ -178,7 +201,11 @@ func (t *Tool[T]) RunCheck(patterns []string, opts Options) {
 	}
 
 	actual := t.Gather(patterns)
-	allowed := scope.Filter(t.LoadAllow(), inScope)
+	allowed := scope.Filter(t.LoadAllow(), func(entry T) string {
+		// String is the canonical allow-file line for an entry, so one
+		// accessor answers for both the parsed entries and the raw file.
+		return t.allowPath(entry.String())
+	}, inScope)
 
 	newItems, removedItems := diff(actual, allowed)
 

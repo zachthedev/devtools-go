@@ -1,6 +1,10 @@
 package deadcode
 
-import "testing"
+import (
+	"testing"
+
+	"zach.tools/go/devtools/internal/scope"
+)
 
 // ///////////////////////////////////////////////
 // Entry.String
@@ -73,5 +77,31 @@ func TestParseOutput_EmptyInput(t *testing.T) {
 	got := parseOutput("")
 	if len(got) != 0 {
 		t.Errorf("empty input produced %d entries", len(got))
+	}
+}
+
+// ///////////////////////////////////////////////
+// allowPath
+// ///////////////////////////////////////////////
+
+func TestAllowPath_ResolvesAnEntryToAPathScopeMatchingAccepts(t *testing.T) {
+	// The round trip the accessor exists for. An entry's own canonical line
+	// has to resolve to a path a scope matcher accepts, or every entry
+	// filters out of scope and the tool rejects the allow file it wrote.
+	entry := Entry{File: "internal/foo/bar.go", Func: "SomeFunc"}
+
+	if got, want := allowPath(entry.String()), "internal/foo/bar.go"; got != want {
+		t.Errorf("allowPath(%q) = %q, want %q", entry.String(), got, want)
+	}
+	if !scope.Matcher([]string{"internal/foo"})(allowPath(entry.String())) {
+		t.Error("a scoped run drops an entry that is inside its own scope")
+	}
+}
+
+func TestAllowPath_AnswersWithWhatALineWithNoFunctionHolds(t *testing.T) {
+	// A hand-edited allow file is ordinary, and a line missing its second
+	// field still names a path. Answering empty would match every scope.
+	if got, want := allowPath("internal/foo/bar.go"), "internal/foo/bar.go"; got != want {
+		t.Errorf("allowPath = %q, want %q", got, want)
 	}
 }

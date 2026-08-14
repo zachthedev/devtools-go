@@ -70,7 +70,16 @@ func Tool() *driver.Tool[Entry] {
 		ToFinding: func(e Entry) report.Finding {
 			return report.Finding{Kind: "unreachable", File: e.File, Detail: e.Func}
 		},
+		AllowPath: allowPath,
 	}
+}
+
+// allowPath reports the file path in one .allow.deadcode line, whose shape
+// is "<file> <func>". The path comes first here and second in testpair's
+// file, which is why each tool states its own.
+func allowPath(line string) string {
+	file, _, _ := strings.Cut(line, " ")
+	return file
 }
 
 // ///////////////////////////////////////////////

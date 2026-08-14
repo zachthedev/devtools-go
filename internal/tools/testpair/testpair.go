@@ -72,7 +72,19 @@ func Tool() *driver.Tool[Issue] {
 		ToFinding: func(i Issue) report.Finding {
 			return report.Finding{Kind: i.Kind, File: i.File, Detail: i.Message}
 		},
+		AllowPath: allowPath,
 	}
+}
+
+// allowPath reports the file path in one .allow.testpair line, whose shape
+// is "<kind> <file> <message>". The path comes second here and first in
+// deadcode's file, which is why each tool states its own.
+func allowPath(line string) string {
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 {
+		return line
+	}
+	return parts[1]
 }
 
 // ///////////////////////////////////////////////
