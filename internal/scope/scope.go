@@ -147,10 +147,10 @@ func Matcher(pkgDirs []string) func(path string) bool {
 	}
 	normalized := make([]string, 0, len(pkgDirs))
 	for _, d := range pkgDirs {
-		normalized = append(normalized, filepath.ToSlash(d))
+		normalized = append(normalized, slashed(d))
 	}
 	return func(path string) bool {
-		path = filepath.ToSlash(path)
+		path = slashed(path)
 		for _, d := range normalized {
 			if path == d || strings.HasPrefix(path, d+"/") {
 				return true
@@ -158,6 +158,17 @@ func Matcher(pkgDirs []string) func(path string) bool {
 		}
 		return false
 	}
+}
+
+// slashed rewrites a path into the forward-slash form allow files hold.
+//
+// filepath.ToSlash leaves a backslash alone everywhere except Windows,
+// because a backslash is a legal character in a POSIX filename. An allow
+// file is committed and read on every platform, so a path written on
+// Windows has to resolve the same way on a Linux runner as it does on the
+// machine that produced it.
+func slashed(path string) string {
+	return strings.ReplaceAll(path, `\`, "/")
 }
 
 // Filter returns items whose path the keep predicate accepts. path reports

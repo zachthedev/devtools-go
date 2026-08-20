@@ -82,9 +82,12 @@ func TestMatcher_JudgesThePathItIsGivenAndParsesNothing(t *testing.T) {
 }
 
 func TestMatcher_ForwardSlashNormalization(t *testing.T) {
-	// Windows-style backslash paths should match against forward-slash scopes.
+	// A backslash path has to match a forward-slash scope on every
+	// platform, not just on Windows. Allow files are committed, so the
+	// runner reading one is rarely the machine that wrote it, and
+	// filepath.ToSlash would answer differently on each.
 	m := Matcher([]string{"internal/foo"})
-	if !m("internal\\foo\\bar.go") {
+	if !m(`internal\foo\bar.go`) {
 		t.Error("Matcher should normalize backslashes")
 	}
 }
