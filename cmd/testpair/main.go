@@ -1,7 +1,8 @@
-// Testpair is a single-tool entry point for the test-pairing check.
-// Use this when your repo only needs one devtool and you'd rather
-// invoke `go tool testpair` than `go tool devtools testpair`.
-// The meta-dispatcher at ./cmd/devtools exposes the same tool.
+// Testpair reports source files with no _test.go companion, test files with
+// no source, and test functions named for a symbol their package does not
+// declare. Findings are compared against .allow.testpair.
+//
+// Declare it as a tool dependency to invoke it as `go tool testpair`.
 package main
 
 import (

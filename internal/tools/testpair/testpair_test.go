@@ -191,12 +191,248 @@ func TestGhost(t *testing.T) {}
 	sources := map[string][]string{pkgDir: {"bar.go"}}
 	tests := map[string][]string{pkgDir: {"bar_test.go"}}
 
-	issues := findNamingMismatches(sources, tests)
+	issues, errs := findNamingMismatches(sources, tests)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
 	if len(issues) != 1 {
 		t.Fatalf("expected 1 name-mismatch, got %d: %v", len(issues), issues)
 	}
 	if !strings.Contains(issues[0].Message, "Ghost") {
 		t.Errorf("expected message mentioning Ghost, got %+v", issues[0])
+	}
+}
+
+func TestFindNamingMismatches_ReportsASourceFileItCannotParse(t *testing.T) {
+	// A symbol set built from a partial read is missing whatever the
+	// unreadable file declared, so tests naming those symbols look like
+	// mismatches. Surfacing the parse failure is what stops the tool
+	// reporting its own blindness as a finding about the code.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/bar.go", "package foo\n\nfunc Bar() {}\n")
+	writeFile(t, dir, "foo/broken.go", "package foo\n\nfunc Ghost( {}\n")
+	writeFile(t, dir, "foo/bar_test.go", `package foo
+
+import "testing"
+
+func TestGhost(t *testing.T) {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"bar.go", "broken.go"}}
+	tests := map[string][]string{pkgDir: {"bar_test.go"}}
+
+	_, errs := findNamingMismatches(sources, tests)
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 parse error, got %d: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "broken.go") {
+		t.Errorf("parse error does not name the file: %v", errs[0])
+	}
+}
+
+func TestFindNamingMismatches_ReportsATestFileItCannotParse(t *testing.T) {
+	// A test file that fails to parse contributes no test functions, so
+	// every convention violation inside it goes unreported.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/bar.go", "package foo\n\nfunc Bar() {}\n")
+	writeFile(t, dir, "foo/bar_test.go", "package foo\n\nfunc TestGhost( {}\n")
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"bar.go"}}
+	tests := map[string][]string{pkgDir: {"bar_test.go"}}
+
+	issues, errs := findNamingMismatches(sources, tests)
+
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 parse error, got %d: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0].Error(), "bar_test.go") {
+		t.Errorf("parse error does not name the file: %v", errs[0])
+	}
+	if len(issues) != 0 {
+		t.Errorf("a file that did not parse produced findings: %v", issues)
+	}
+}
+
+func TestFindNamingMismatches_AcceptsTheTestBinaryEntryPoint(t *testing.T) {
+	// TestMain(m *testing.M) is named for the role go test gives it, not for
+	// a symbol under test. Flagging it asks every package that defines one
+	// to declare a symbol called Main, which no package has.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/bar.go", "package foo\n\nfunc Bar() {}\n")
+	writeFile(t, dir, "foo/bar_test.go", `package foo
+
+import (
+	"os"
+	"testing"
+)
+
+func TestMain(m *testing.M) { os.Exit(m.Run()) }
+func TestBar(t *testing.T)  {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"bar.go"}}
+	tests := map[string][]string{pkgDir: {"bar_test.go"}}
+
+	issues, errs := findNamingMismatches(sources, tests)
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+	if len(issues) != 0 {
+		t.Errorf("the test binary entry point was flagged: %v", issues)
+	}
+}
+
+func TestFindNamingMismatches_StillChecksATestNamedForASymbolCalledMain(t *testing.T) {
+	// The exemption is for the entry point, which go test identifies by its
+	// parameter. A TestMain taking *testing.T is an ordinary test, so the
+	// symbol rule still applies and there is no symbol Main to satisfy it.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/bar.go", "package foo\n\nfunc Bar() {}\n")
+	writeFile(t, dir, "foo/bar_test.go", `package foo
+
+import "testing"
+
+func TestMain(t *testing.T) {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"bar.go"}}
+	tests := map[string][]string{pkgDir: {"bar_test.go"}}
+
+	issues, _ := findNamingMismatches(sources, tests)
+
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 name-mismatch, got %d: %v", len(issues), issues)
+	}
+	if !strings.Contains(issues[0].Message, "Main") {
+		t.Errorf("expected a message about the symbol Main, got %+v", issues[0])
+	}
+}
+
+func TestFindNamingMismatches_ReportsATestThatNamesNoSymbol(t *testing.T) {
+	// `func Test(t *testing.T)` is a legal test that go test runs, and it
+	// names nothing for the convention to check. Passing over it silently
+	// exempts it without an allow entry, so one test per package could
+	// always sidestep the rule.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/bar.go", "package foo\n\nfunc Bar() {}\n")
+	writeFile(t, dir, "foo/bar_test.go", `package foo
+
+import "testing"
+
+func Test(t *testing.T) {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"bar.go"}}
+	tests := map[string][]string{pkgDir: {"bar_test.go"}}
+
+	issues, _ := findNamingMismatches(sources, tests)
+
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 finding for a test naming no symbol, got %d: %v", len(issues), issues)
+	}
+	if !strings.Contains(issues[0].Message, "names no symbol") {
+		t.Errorf("message does not say what is wrong: %+v", issues[0])
+	}
+}
+
+func TestFindNamingMismatches_ChecksAPackageWhoseSourceDeclaresNothing(t *testing.T) {
+	// An empty symbol set means every test name in the package matches
+	// nothing, which is the strongest form of the finding rather than a
+	// reason to skip. Skipping let a doc.go with a package clause carry any
+	// test name at all.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/doc.go", "// Package foo does nothing.\npackage foo\n")
+	writeFile(t, dir, "foo/doc_test.go", `package foo
+
+import "testing"
+
+func TestCompletelyMadeUp(t *testing.T) {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{pkgDir: {"doc.go"}}
+	tests := map[string][]string{pkgDir: {"doc_test.go"}}
+
+	issues, errs := findNamingMismatches(sources, tests)
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 name-mismatch, got %d: %v", len(issues), issues)
+	}
+	if !strings.Contains(issues[0].Message, "CompletelyMadeUp") {
+		t.Errorf("message does not name the test: %+v", issues[0])
+	}
+}
+
+func TestFindNamingMismatches_SkipsADirectoryWithNoSourceAtAll(t *testing.T) {
+	// The orphan-test check already answers for a directory holding only
+	// tests, and its test names have nothing to be matched against. A
+	// second finding on the same file would say the same thing twice.
+	dir := t.TempDir()
+	writeFile(t, dir, "foo/orphan_test.go", `package foo
+
+import "testing"
+
+func TestGhost(t *testing.T) {}
+`)
+
+	pkgDir := filepath.Join(dir, "foo")
+	sources := map[string][]string{}
+	tests := map[string][]string{pkgDir: {"orphan_test.go"}}
+
+	issues, _ := findNamingMismatches(sources, tests)
+
+	if len(issues) != 0 {
+		t.Errorf("a source-free directory produced name-mismatch findings: %v", issues)
+	}
+}
+
+// ///////////////////////////////////////////////
+// collectFiles
+// ///////////////////////////////////////////////
+
+func TestCollectFiles_SplitsSourceFromTest(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "bar.go", "package foo\n")
+	writeFile(t, dir, "bar_test.go", "package foo\n")
+	writeFile(t, dir, "notes.txt", "ignored\n")
+
+	sources := map[string][]string{}
+	tests := map[string][]string{}
+	if err := collectFiles(dir, sources, tests); err != nil {
+		t.Fatalf("collectFiles: %v", err)
+	}
+
+	if !slices.Equal(sources[dir], []string{"bar.go"}) {
+		t.Errorf("sources = %v, want [bar.go]", sources[dir])
+	}
+	if !slices.Equal(tests[dir], []string{"bar_test.go"}) {
+		t.Errorf("tests = %v, want [bar_test.go]", tests[dir])
+	}
+}
+
+func TestCollectFiles_ReportsADirectoryItCannotRead(t *testing.T) {
+	// An unreadable directory contributes no files, so every convention
+	// its package violates goes unreported. Answering with an error is
+	// what keeps that from reading as a package with nothing wrong.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+
+	err := collectFiles(missing, map[string][]string{}, map[string][]string{})
+
+	if err == nil {
+		t.Fatal("collectFiles accepted a directory it could not read")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("error does not name the directory: %v", err)
 	}
 }
 

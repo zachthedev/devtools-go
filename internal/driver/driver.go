@@ -53,7 +53,7 @@ type Tool[T fmt.Stringer] struct {
 	// AllowFile is the repo-relative path to the tool's allow file.
 	AllowFile string
 	// UpdateCmd is the command shown to users to regenerate the allow
-	// file (e.g., "go tool devtools testpair update").
+	// file (e.g., "go tool testpair update").
 	UpdateCmd string
 	// Categories are the valid allow-list category tags.
 	Categories []allowlist.Category
@@ -91,7 +91,31 @@ type Report[T any] struct {
 	New     []T `json:"new"`
 	Removed []T `json:"removed"`
 	Total   int `json:"total"`
+	// Error names a failure that stopped the check before it compared
+	// anything. Without it a consumer reading stdout sees the same empty
+	// report for a repository with no drift and a run that never happened.
+	Error string `json:"error,omitempty"`
 }
+
+// invocation is a tool's command line after parsing.
+type invocation struct {
+	Mode     string
+	Opts     Options
+	Patterns []string
+}
+
+// ///////////////////////////////////////////////
+// Constants
+// ///////////////////////////////////////////////
+
+// The modes a command line can select. Check is the default, so a bare
+// invocation with no subcommand runs one.
+const (
+	modeCheck    = "check"
+	modeUpdate   = "update"
+	modeValidate = "validate"
+	modeHelp     = "help"
+)
 
 // ///////////////////////////////////////////////
 // Entry point
@@ -101,14 +125,21 @@ type Report[T any] struct {
 // dispatches to the chosen subcommand, and calls os.Exit with the right
 // code.
 func Main[T fmt.Stringer](t *Tool[T]) {
-	mode, opts, patterns := parseArgs(t.Name)
-	switch mode {
-	case "update":
-		t.RunUpdate(patterns)
-	case "validate":
-		t.RunValidate(patterns)
-	case "check":
-		t.RunCheck(patterns, opts)
+	inv, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n\n", err)
+		printUsage(t.Name)
+		os.Exit(2)
+	}
+	switch inv.Mode {
+	case modeHelp:
+		printUsage(t.Name)
+	case modeUpdate:
+		t.RunUpdate(inv.Patterns)
+	case modeValidate:
+		t.RunValidate(inv.Patterns)
+	case modeCheck:
+		t.RunCheck(inv.Patterns, inv.Opts)
 	}
 }
 
@@ -117,20 +148,47 @@ func Main[T fmt.Stringer](t *Tool[T]) {
 // ///////////////////////////////////////////////
 
 // RunUpdate regenerates the allow file from the current findings.
+//
+// Two things carry over from the file already there. Entries outside the
+// patterns are kept, because a scoped run reads part of the module and
+// deleting the rest would punish them for not having been looked for. Tags
+// on entries that are still findings are kept too, so classifying an entry
+// is something a maintainer does once. A line nobody has recorded arrives
+// untagged, which is the rubber-stamped addition the check exists to stop.
 func (t *Tool[T]) RunUpdate(patterns []string) {
 	actual := t.Gather(patterns)
+	inScope := t.lineInScope(patterns)
 
-	lines := make([]string, len(actual))
-	for i, x := range actual {
-		lines[i] = x.String()
+	prior := map[string]string{}
+	var retained []allowlist.Entry
+
+	existing, err := allowlist.LoadEntries(t.AllowFile, t.Categories)
+	switch {
+	case err != nil && !allowlist.IsNotExist(err):
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	case err == nil:
+		for _, e := range existing {
+			prior[e.Line] = e.Tag
+			if !inScope(e.Line) {
+				retained = append(retained, e)
+			}
+		}
 	}
 
-	if err := allowlist.WriteUpdate(t.AllowFile, t.Title, t.UpdateCmd, t.Categories, lines); err != nil {
+	entries := make([]allowlist.Entry, 0, len(actual)+len(retained))
+	for _, x := range actual {
+		line := x.String()
+		entries = append(entries, allowlist.Entry{Tag: prior[line], Line: line})
+	}
+	entries = append(entries, retained...)
+
+	if err := allowlist.WriteUpdate(t.AllowFile, t.Title, t.UpdateCmd, t.Categories, entries); err != nil {
 		fmt.Fprintf(os.Stderr, "error: writing %s: %v\n", t.AllowFile, err)
 		os.Exit(2)
 	}
 
-	report.PrintUpdated(os.Stderr, len(actual), t.AllowFile)
+	report.PrintUpdated(os.Stderr, len(entries), t.AllowFile)
 }
 
 // allowPath reports the file path in one allow-file line, defaulting to
@@ -145,9 +203,16 @@ func (t *Tool[T]) allowPath(line string) string {
 }
 
 // lineInScope returns a predicate reporting whether one allow-file line
-// falls within the patterns.
+// falls within the patterns. It exits 2 when the patterns cannot be
+// resolved, because a scope nobody established filters every entry and
+// leaves the check comparing two empty sets.
 func (t *Tool[T]) lineInScope(patterns []string) func(line string) bool {
-	inScope := scope.Matcher(scope.PackageDirs(patterns))
+	dirs, err := scope.PackageDirs(patterns)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	inScope := scope.Matcher(dirs)
 	return func(line string) bool { return inScope(t.allowPath(line)) }
 }
 
@@ -164,7 +229,7 @@ func (t *Tool[T]) RunValidate(patterns []string) {
 		return
 	}
 
-	uncat, err := allowlist.Validate(t.AllowFile, t.lineInScope(patterns))
+	uncat, err := allowlist.Validate(t.AllowFile, t.Categories, t.lineInScope(patterns))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -189,13 +254,16 @@ func (t *Tool[T]) RunCheck(patterns []string, opts Options) {
 	inScope := t.lineInScope(patterns)
 
 	if _, err := os.Stat(t.AllowFile); err == nil {
-		uncat, vErr := allowlist.Validate(t.AllowFile, inScope)
+		uncat, vErr := allowlist.Validate(t.AllowFile, t.Categories, inScope)
 		if vErr != nil {
 			fmt.Fprintln(os.Stderr, vErr)
+			t.failJSON(opts, vErr.Error())
 			os.Exit(2)
 		}
 		if len(uncat) > 0 {
 			report.PrintUncategorized(os.Stderr, uncat, t.AllowFile)
+			t.failJSON(opts, fmt.Sprintf("%s: %s with no [category] tag",
+				t.AllowFile, report.Count(len(uncat), "entry", "entries")))
 			os.Exit(1)
 		}
 	}
@@ -211,12 +279,15 @@ func (t *Tool[T]) RunCheck(patterns []string, opts Options) {
 
 	if opts.JSON {
 		w, closer := report.OpenJSONOutput(opts.JSONPath)
-		defer closer()
 		report.WriteJSONTo(w, Report[T]{
 			New:     report.Coalesce(newItems),
 			Removed: report.Coalesce(removedItems),
 			Total:   len(actual),
 		})
+		// Closed here rather than deferred, because os.Exit runs no
+		// deferred call and the flush error would go unreported on exactly
+		// the run that reports drift.
+		closer()
 		if len(newItems) > 0 {
 			os.Exit(1)
 		}
@@ -254,6 +325,18 @@ func (t *Tool[T]) RunCheck(patterns []string, opts Options) {
 	}
 
 	os.Exit(exitCode)
+}
+
+// failJSON writes a report carrying only an error, for a failure that
+// stops the check before it compares anything. It does nothing unless
+// --json was asked for, so the text path is unaffected.
+func (t *Tool[T]) failJSON(opts Options, msg string) {
+	if !opts.JSON {
+		return
+	}
+	w, closer := report.OpenJSONOutput(opts.JSONPath)
+	report.WriteJSONTo(w, Report[T]{New: []T{}, Removed: []T{}, Error: msg})
+	closer()
 }
 
 // findings maps the tool's domain items through ToFinding.
@@ -298,42 +381,49 @@ func indexByString[T fmt.Stringer](items []T) map[string]struct{} {
 	return m
 }
 
-// parseArgs extracts mode, flags, and package patterns from os.Args.
-// toolName is used in the --help output.
-func parseArgs(toolName string) (mode string, opts Options, patterns []string) {
-	mode = "check"
-	for _, arg := range os.Args[1:] {
+// parseArgs turns a tool's arguments into an [invocation].
+//
+// An argument that starts with a dash and names no flag above is an error.
+// A go-list pattern never begins with one, so treating it as a pattern
+// would hand a misspelled flag to go list and report it as a package that
+// does not exist.
+func parseArgs(argv []string) (invocation, error) {
+	inv := invocation{Mode: modeCheck}
+	for _, arg := range argv {
 		switch {
-		case arg == "update":
-			mode = "update"
-		case arg == "validate":
-			mode = "validate"
+		case arg == modeUpdate:
+			inv.Mode = modeUpdate
+		case arg == modeValidate:
+			inv.Mode = modeValidate
 		case arg == "--json":
-			opts.JSON = true
+			inv.Opts.JSON = true
 		case strings.HasPrefix(arg, "--json="):
-			opts.JSON = true
-			opts.JSONPath = strings.TrimPrefix(arg, "--json=")
+			inv.Opts.JSON = true
+			inv.Opts.JSONPath = strings.TrimPrefix(arg, "--json=")
 		case arg == "--quiet":
-			opts.Quiet = true
+			inv.Opts.Quiet = true
 		case arg == "--diff":
-			opts.Diff = true
+			inv.Opts.Diff = true
 		case arg == "--help", arg == "-h":
-			printUsage(toolName)
-			os.Exit(0)
+			// Help answers the whole command line, so nothing after it
+			// can select a mode that would run instead.
+			return invocation{Mode: modeHelp}, nil
+		case strings.HasPrefix(arg, "-"):
+			return invocation{}, fmt.Errorf("unknown flag %s", arg)
 		default:
-			patterns = append(patterns, arg)
+			inv.Patterns = append(inv.Patterns, arg)
 		}
 	}
-	if len(patterns) == 0 {
-		patterns = []string{"./..."}
+	if len(inv.Patterns) == 0 {
+		inv.Patterns = []string{"./..."}
 	}
 	// Defensive: Diff + JSON together is ambiguous; the JSON wire shape
 	// already carries enough for a consumer to compute a diff locally.
 	// Prefer JSON if both are set.
-	if opts.JSON {
-		opts.Diff = false
+	if inv.Opts.JSON {
+		inv.Opts.Diff = false
 	}
-	return mode, opts, patterns
+	return inv, nil
 }
 
 // printUsage writes the standard help text for a tool.

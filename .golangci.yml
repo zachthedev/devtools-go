@@ -50,7 +50,11 @@ linters:
         # crypto/auth-critical code where the noise cost is worth paying.
         - G115
     decorder:
-      dec-order: type,const,var,func
+      dec-order:
+        - type
+        - const
+        - var
+        - func
       disable-dec-order-check: false
       disable-init-func-first-check: false
       disable-dec-num-check: true # allow multiple const/var blocks (grouped by concern)

@@ -36,19 +36,25 @@ Every tool follows the same lifecycle:
 
 ### Flags
 
-| Flag           | Effect                                                         |
-| -------------- | -------------------------------------------------------------- |
-| `--json`       | Emit machine-readable diff report to stdout.                   |
-| `--json=PATH`  | Emit the JSON report to PATH. Directory must exist.            |
-| `--quiet`      | Suppress the clean-pass summary line.                          |
-| `--diff`       | Render check output as a unified +/- diff.                     |
-| `--color=W`    | Force color: `auto` (default), `on`, `off`. Honors `NO_COLOR`. |
-| `--help`, `-h` | Show tool usage.                                               |
+| Flag           | Effect                                              |
+| -------------- | --------------------------------------------------- |
+| `--json`       | Emit machine-readable diff report to stdout.        |
+| `--json=PATH`  | Emit the JSON report to PATH. Directory must exist. |
+| `--quiet`      | Suppress the clean-pass summary line.               |
+| `--diff`       | Render check output as a unified +/- diff.          |
+| `--help`, `-h` | Show tool usage.                                    |
+
+Color is automatic when stderr is a terminal, and honors `NO_COLOR`. No flag
+controls it.
 
 Positional arguments are `go list` patterns (`./cmd/...`, `./internal/foo/...`).
 With no positional argument, the tool defaults to `./...`. Scoped runs skip
 out-of-scope entries in the allow file and ignore out-of-scope uncategorized
 tags, so a focused run doesn't trip on drift in untouched parts of the repo.
+
+An argument starting with `-` that names no flag above is rejected. A
+`go list` pattern never begins with one, so accepting it would hand a
+misspelled flag to `go list` and report it as a package that does not exist.
 
 ### Exit codes
 
@@ -70,6 +76,50 @@ tool (
 ```
 
 Then `go mod tidy`.
+
+## The deadcode analyzer
+
+`deadcode` reads the reachability analysis from
+`golang.org/x/tools/cmd/deadcode`, which ships as its own binary. That binary
+is compiled separately from the toolchain that builds your module, so the two
+drift apart whenever one is upgraded alone. An analyzer older than the
+language version your `go.mod` declares cannot type-check your packages, and
+answers with errors rather than findings.
+
+The tool picks one of three, in order:
+
+| Source               | Selected when                                           |
+| -------------------- | ------------------------------------------------------- |
+| `$DEADCODE`          | Set. Names the binary to run.                           |
+| `go tool` build      | Your module declares the analyzer as a tool dependency. |
+| `deadcode` on `PATH` | Otherwise.                                              |
+
+The middle one cannot go stale, because the toolchain that builds your code
+builds the analyzer too. Declare it alongside the wrapper:
+
+```go
+tool (
+    golang.org/x/tools/cmd/deadcode
+    zach.tools/go/devtools/cmd/deadcode
+)
+```
+
+Both are named `deadcode`, so the short name is then ambiguous and the module
+path picks one:
+
+```bash
+go tool zach.tools/go/devtools/cmd/deadcode
+```
+
+An analyzer that fails is an exit 2 naming both Go versions and the command
+that fixes it. Three signals are treated as failure rather than as an empty
+result: a non-zero exit, output the finding parser cannot read, and a
+missing binary. Anything the analyzer writes to stderr is echoed even when
+it exits zero.
+
+What that does not cover is an analyzer that exits zero having printed
+nothing, which is indistinguishable from a module with no dead code. Set
+`$DEADCODE` only to a binary you would run yourself.
 
 ## Usage
 
@@ -115,8 +165,10 @@ The allow-file header lists them so reviewers know which tags apply.
 testpair:
 	@go tool testpair $(ARGS) ./cmd/... ./internal/...
 
+# The module path, because declaring the analyzer as a tool dependency
+# leaves two tools answering to the name deadcode.
 deadcode:
-	@go tool deadcode $(ARGS) ./cmd/... ./internal/...
+	@go tool zach.tools/go/devtools/cmd/deadcode $(ARGS) ./cmd/... ./internal/...
 ```
 
 Pass a subcommand or flag through `ARGS`, e.g. `make testpair ARGS=update`

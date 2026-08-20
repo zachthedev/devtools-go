@@ -2,6 +2,9 @@ package scope
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -18,12 +21,16 @@ func (s stringID) String() string { return string(s) }
 // Matcher
 // ///////////////////////////////////////////////
 
-func TestMatcher_EmptyPkgDirsMatchesEverything(t *testing.T) {
+func TestMatcher_EmptyPkgDirsMatchesNothing(t *testing.T) {
+	// No resolved package means no scope was established, and a matcher
+	// that said yes there would hand a caller a scope it never had. The
+	// direction matters: a yes keeps every allow entry while the scan
+	// found none, and the check then reports a clean pass over nothing.
+	// A no leaves every finding unallowed, which fails loudly.
 	m := Matcher(nil)
-	cases := []string{"foo", "foo/bar.go", "internal/x/y.go", ""}
-	for _, c := range cases {
-		if !m(c) {
-			t.Errorf("Matcher(nil) rejected %q", c)
+	for _, c := range []string{"foo", "foo/bar.go", "internal/x/y.go", ""} {
+		if m(c) {
+			t.Errorf("Matcher(nil) accepted %q", c)
 		}
 	}
 }
@@ -80,6 +87,106 @@ func TestMatcher_ForwardSlashNormalization(t *testing.T) {
 	if !m("internal\\foo\\bar.go") {
 		t.Error("Matcher should normalize backslashes")
 	}
+}
+
+// ///////////////////////////////////////////////
+// PackageDirs
+// ///////////////////////////////////////////////
+
+// inModule runs fn with the working directory set to a throwaway module
+// holding the given package directories.
+func inModule(t *testing.T, pkgs []string, fn func()) {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	write("go.mod", "module probe.example/x\n\ngo 1.27.0\n")
+	for _, p := range pkgs {
+		write(filepath.Join(p, "doc.go"), "package "+filepath.Base(p)+"\n")
+	}
+	// An empty directory that go list will match no package in.
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+
+	// t.Chdir restores on cleanup and refuses a parallel test, which a
+	// process-wide working directory cannot survive.
+	t.Chdir(dir)
+	fn()
+}
+
+func TestPackageDirs_ResolvesPatternsToRelativeDirs(t *testing.T) {
+	inModule(t, []string{"internal/foo", "internal/bar"}, func() {
+		got, err := PackageDirs([]string{"./internal/..."})
+		if err != nil {
+			t.Fatalf("PackageDirs: %v", err)
+		}
+		want := []string{"internal/bar", "internal/foo"}
+		if !slices.Equal(got, want) {
+			t.Errorf("PackageDirs = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestPackageDirs_RefusesAPatternThatMatchesNoPackage(t *testing.T) {
+	// go list reports this as a warning and still exits zero. Reading only
+	// its combined output would narrow the scope to whatever did match, and
+	// a scope narrowed to nothing finds nothing, which a check calls a pass.
+	inModule(t, []string{"internal/foo"}, func() {
+		_, err := PackageDirs([]string{"./docs/..."})
+
+		if err == nil {
+			t.Fatal("PackageDirs accepted a pattern matching no package")
+		}
+		if !strings.Contains(err.Error(), "./docs/...") {
+			t.Errorf("error does not name the pattern: %v", err)
+		}
+	})
+}
+
+func TestPackageDirs_RefusesADeadPatternBesideALiveOne(t *testing.T) {
+	// The half-vacuous case, and the one that gives no signal at all. One
+	// good pattern still produces directories, so a caller checking only
+	// for an empty result would carry on with a scope quietly missing
+	// whatever the dead pattern was meant to cover.
+	inModule(t, []string{"internal/foo"}, func() {
+		_, err := PackageDirs([]string{"./internal/...", "./docs/..."})
+
+		if err == nil {
+			t.Fatal("PackageDirs accepted a dead pattern beside a live one")
+		}
+		if !strings.Contains(err.Error(), "./docs/...") {
+			t.Errorf("error does not name the dead pattern: %v", err)
+		}
+	})
+}
+
+func TestPackageDirs_DefaultsToTheWholeModule(t *testing.T) {
+	inModule(t, []string{"internal/foo"}, func() {
+		got, err := PackageDirs(nil)
+		if err != nil {
+			t.Fatalf("PackageDirs: %v", err)
+		}
+		if !slices.Contains(got, "internal/foo") {
+			t.Errorf("PackageDirs(nil) = %v, want it to include internal/foo", got)
+		}
+	})
+}
+
+func TestPackageDirs_ReportsAPatternGoListRejects(t *testing.T) {
+	inModule(t, []string{"internal/foo"}, func() {
+		if _, err := PackageDirs([]string{"./nope/..."}); err == nil {
+			t.Error("PackageDirs accepted a directory that does not exist")
+		}
+	})
 }
 
 // ///////////////////////////////////////////////

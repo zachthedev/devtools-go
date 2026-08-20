@@ -1,0 +1,2 @@
+# Written by `make coverage` and read by go-test-coverage in the same run.
+coverage.out

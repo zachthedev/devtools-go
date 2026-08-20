@@ -9,6 +9,7 @@ package testpair
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -60,11 +61,12 @@ func Tool() *driver.Tool[Issue] {
 		Name:      "testpair",
 		Title:     "Test pairing",
 		AllowFile: allowFile,
-		UpdateCmd: "go tool devtools testpair update",
+		UpdateCmd: "go tool testpair update",
 		Categories: []allowlist.Category{
 			{Tag: "multi-file", Description: "subcommand files tested via main_test.go"},
 			{Tag: "cross-pkg", Description: "test covers symbols from a different package"},
 			{Tag: "convention", Description: "naming follows project convention, not strict Go idiom"},
+			{Tag: "entry-point", Description: "package clause and a one-line main; behaviour tested in internal/"},
 			{Tag: "scenario", Description: "integration/scenario test not tied to one symbol"},
 		},
 		Gather:    findAllIssues,
@@ -92,30 +94,64 @@ func allowPath(line string) string {
 // ///////////////////////////////////////////////
 
 // findAllIssues runs all three checks in parallel and returns sorted
-// findings. Each check is independent — missing-test and orphan-test walk
-// the same dir maps, name-mismatch parses the test files — so they can run
-// concurrently without shared-state contention.
+// findings. Each check is independent, so missing-test and orphan-test
+// walk the same dir maps while name-mismatch parses the test files.
+//
+// A file this cannot read or parse ends the run. Both halves of the
+// name-mismatch check read source to build the symbol set it compares
+// against, so an unreadable file shrinks that set and turns matching test
+// names into findings. A whole directory that fails to parse drops out of
+// the check instead, which reports nothing at all.
 func findAllIssues(patterns []string) []Issue {
-	pkgDirs := scope.PackageDirs(patterns)
+	pkgDirs, err := scope.PackageDirs(patterns)
+	if err != nil {
+		refuse(err)
+	}
 	sourceByDir := map[string][]string{}
 	testByDir := map[string][]string{}
 
+	var readErrs []error
 	for _, dir := range pkgDirs {
-		collectFiles(dir, sourceByDir, testByDir)
+		if err := collectFiles(dir, sourceByDir, testByDir); err != nil {
+			readErrs = append(readErrs, err)
+		}
+	}
+	if len(readErrs) > 0 {
+		refuse(errors.Join(readErrs...))
 	}
 
 	var (
 		wg                              sync.WaitGroup
 		missing, orphan, nameMismatches []Issue
+		parseErrs                       []error
 	)
 	wg.Go(func() { missing = findMissingTests(sourceByDir, testByDir) })
 	wg.Go(func() { orphan = findOrphanTests(sourceByDir, testByDir) })
-	wg.Go(func() { nameMismatches = findNamingMismatches(sourceByDir, testByDir) })
+	wg.Go(func() { nameMismatches, parseErrs = findNamingMismatches(sourceByDir, testByDir) })
 	wg.Wait()
+
+	if len(parseErrs) > 0 {
+		refuse(errors.Join(parseErrs...))
+	}
 
 	issues := slices.Concat(missing, orphan, nameMismatches)
 	slices.SortFunc(issues, compareIssue)
 	return issues
+}
+
+// refuse reports that the scan was incomplete and exits 2. It never
+// returns.
+//
+// Findings from a partial read describe the files that happened to load,
+// not the package, so reporting them would put a number on an answer the
+// scan does not have.
+func refuse(err error) {
+	fmt.Fprintf(os.Stderr, "error: testpair could not read every file it needs:\n\n")
+	for line := range strings.SplitSeq(err.Error(), "\n") {
+		fmt.Fprintf(os.Stderr, "  %s\n", report.Block(line))
+	}
+	fmt.Fprintf(os.Stderr, "\nFix the listed files, or narrow the run to packages that parse.\n")
+	os.Exit(2)
 }
 
 // compareIssue orders issues by (Kind, File, Message) for stable output.
@@ -135,10 +171,10 @@ func compareIssue(a, b Issue) int {
 
 // collectFiles reads a single directory and groups .go files into source
 // and test buckets.
-func collectFiles(dir string, sourceByDir, testByDir map[string][]string) {
+func collectFiles(dir string, sourceByDir, testByDir map[string][]string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return fmt.Errorf("reading package directory %s: %w", dir, err)
 	}
 	for _, e := range entries {
 		name := e.Name()
@@ -151,6 +187,7 @@ func collectFiles(dir string, sourceByDir, testByDir map[string][]string) {
 			sourceByDir[dir] = append(sourceByDir[dir], name)
 		}
 	}
+	return nil
 }
 
 // ///////////////////////////////////////////////
@@ -197,20 +234,43 @@ func findOrphanTests(sourceByDir, testByDir map[string][]string) []Issue {
 }
 
 // findNamingMismatches flags test functions whose name prefix does not match
-// any symbol in the package.
-func findNamingMismatches(sourceByDir, testByDir map[string][]string) []Issue {
-	var issues []Issue
+// any symbol in the package. It returns the parse failures it hit alongside
+// the findings, because a symbol set built from a partial read produces
+// mismatches that say more about the reader than the code.
+func findNamingMismatches(sourceByDir, testByDir map[string][]string) ([]Issue, []error) {
+	var (
+		issues []Issue
+		errs   []error
+	)
 	for dir, tests := range testByDir {
-		pkgSymbols := buildSymbolSet(dir, sourceByDir[dir])
-		if len(pkgSymbols) == 0 {
+		// A directory holding no source at all is already answered by the
+		// orphan-test check, and its test names have nothing to match
+		// against. A directory that does hold source is checked even when
+		// that source declares nothing, because an empty symbol set means
+		// every test name in it matches nothing.
+		if len(sourceByDir[dir]) == 0 {
 			continue
 		}
+		pkgSymbols, symErrs := buildSymbolSet(dir, sourceByDir[dir])
+		errs = append(errs, symErrs...)
 
 		for _, test := range tests {
 			testPath := filepath.Join(dir, test)
-			for _, funcName := range extractTestFuncs(testPath) {
+			funcs, err := extractTestFuncs(testPath)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			for _, funcName := range funcs {
 				base := extractTestBase(funcName)
 				if base == "" {
+					// `func Test` is a legal test that names no symbol, so
+					// the convention has nothing to hold it to.
+					issues = append(issues, Issue{
+						Kind:    "name-mismatch",
+						File:    dir + "/" + test,
+						Message: funcName + ": names no symbol to test",
+					})
 					continue
 				}
 				if _, ok := pkgSymbols[base]; !ok {
@@ -223,7 +283,7 @@ func findNamingMismatches(sourceByDir, testByDir map[string][]string) []Issue {
 			}
 		}
 	}
-	return issues
+	return issues, errs
 }
 
 // ///////////////////////////////////////////////
@@ -233,45 +293,53 @@ func findNamingMismatches(sourceByDir, testByDir map[string][]string) []Issue {
 // buildSymbolSet collects all function, method, type, var, and const names
 // from every source file in a package directory. Includes capitalized forms
 // of unexported names so TestFoo matches an unexported foo.
-func buildSymbolSet(dir string, sources []string) map[string]struct{} {
+func buildSymbolSet(dir string, sources []string) (map[string]struct{}, []error) {
 	symbols := map[string]struct{}{}
 	fset := token.NewFileSet()
 
+	var errs []error
 	for _, src := range sources {
-		f, err := parser.ParseFile(fset, filepath.Join(dir, src), nil, 0)
+		path := filepath.Join(dir, src)
+		f, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("parsing %s: %w", path, err))
 			continue
 		}
 		for _, decl := range f.Decls {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
-				symbols[d.Name.Name] = struct{}{}
-				symbols[upperFirst(d.Name.Name)] = struct{}{}
+				addSymbol(symbols, d.Name.Name)
 			case *ast.GenDecl:
 				for _, spec := range d.Specs {
 					switch s := spec.(type) {
 					case *ast.TypeSpec:
-						symbols[s.Name.Name] = struct{}{}
-						symbols[upperFirst(s.Name.Name)] = struct{}{}
+						addSymbol(symbols, s.Name.Name)
 					case *ast.ValueSpec:
 						for _, n := range s.Names {
-							symbols[n.Name] = struct{}{}
-							symbols[upperFirst(n.Name)] = struct{}{}
+							addSymbol(symbols, n.Name)
 						}
 					}
 				}
 			}
 		}
 	}
-	return symbols
+	return symbols, errs
+}
+
+// addSymbol records a declared name under both the spelling it was
+// declared with and its capitalized form, so a test for an unexported
+// symbol can name it the way a test function must start.
+func addSymbol(symbols map[string]struct{}, name string) {
+	symbols[name] = struct{}{}
+	symbols[upperFirst(name)] = struct{}{}
 }
 
 // extractTestFuncs returns all Test* function names from a test file.
-func extractTestFuncs(path string) []string {
+func extractTestFuncs(path string) ([]string, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 
 	var names []string
@@ -280,19 +348,42 @@ func extractTestFuncs(path string) []string {
 		if !ok || fd.Recv != nil {
 			continue
 		}
-		if strings.HasPrefix(fd.Name.Name, "Test") {
+		if strings.HasPrefix(fd.Name.Name, "Test") && !isTestMain(fd) {
 			names = append(names, fd.Name.Name)
 		}
 	}
-	return names
+	return names, nil
+}
+
+// isTestMain reports whether a declaration is the test binary entry point,
+// which go test calls in place of running the tests itself.
+//
+// It is named for the role it plays rather than for a symbol under test, so
+// holding it to the TestSymbol_* convention would ask every package that
+// defines one to declare a symbol named Main. The parameter type is what
+// separates it from an ordinary test of a symbol called Main.
+func isTestMain(fd *ast.FuncDecl) bool {
+	if fd.Name.Name != "TestMain" || fd.Type.Params == nil || len(fd.Type.Params.List) != 1 {
+		return false
+	}
+	star, ok := fd.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := star.X.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "testing" && sel.Sel.Name == "M"
 }
 
 // extractTestBase returns the symbol name from a test function.
 // TestFoo_Bar_Baz returns "Foo"; TestFoo returns "Foo".
 func extractTestBase(name string) string {
 	suffix := strings.TrimPrefix(name, "Test")
-	if idx := strings.Index(suffix, "_"); idx > 0 {
-		return suffix[:idx]
+	if base, _, found := strings.Cut(suffix, "_"); found && base != "" {
+		return base
 	}
 	return suffix
 }
@@ -305,21 +396,35 @@ func extractTestBase(name string) string {
 func loadAllowed() []Issue {
 	lines, err := allowlist.LoadLines(allowFile)
 	if err != nil {
-		// Missing file is fine; treat as empty allow list.
-		if os.IsNotExist(err) {
+		// Missing file is fine; treat as empty allow list. The check is
+		// through allowlist because the errors here are wrapped, and
+		// os.IsNotExist does not unwrap: it answers false for a file that
+		// is plainly absent, and this branch would never run.
+		if allowlist.IsNotExist(err) {
 			return nil
 		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
 	}
 
-	var issues []Issue
+	var (
+		issues    []Issue
+		malformed []string
+	)
 	for _, line := range lines {
 		parts := strings.SplitN(line, " ", 3)
 		if len(parts) != 3 {
+			malformed = append(malformed, line)
 			continue
 		}
 		issues = append(issues, Issue{Kind: parts[0], File: parts[1], Message: parts[2]})
+	}
+	// Skipping a line here would shrink the allow list without saying so,
+	// and the exception count printed on a clean pass would then disagree
+	// with the file it names.
+	if len(malformed) > 0 {
+		report.PrintMalformed(os.Stderr, malformed, allowFile)
+		os.Exit(2)
 	}
 	slices.SortFunc(issues, compareIssue)
 	return issues
@@ -339,10 +444,7 @@ func isGenerated(path string) bool {
 
 	buf := make([]byte, 256)
 	n, _ := f.Read(buf)
-	line := string(buf[:n])
-	if idx := strings.Index(line, "\n"); idx > 0 {
-		line = line[:idx]
-	}
+	line, _, _ := strings.Cut(string(buf[:n]), "\n")
 	return strings.Contains(line, "Auto-generated") ||
 		strings.Contains(line, "Code generated") ||
 		strings.Contains(line, "DO NOT EDIT")
@@ -353,7 +455,7 @@ func isGenerated(path string) bool {
 // ///////////////////////////////////////////////
 
 func upperFirst(s string) string {
-	if len(s) == 0 {
+	if s == "" {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]

@@ -1,0 +1,16 @@
+# Test pairing allow list.
+# Every entry must have a # [category] comment above its group.
+# Entries without a category tag will fail the check.
+#
+# Regenerate: go tool testpair update
+#
+# Categories:
+#   [multi-file]  subcommand files tested via main_test.go
+#   [cross-pkg]  test covers symbols from a different package
+#   [convention]  naming follows project convention, not strict Go idiom
+#   [entry-point]  package clause and a one-line main; behaviour tested in internal/
+#   [scenario]  integration/scenario test not tied to one symbol
+
+# [entry-point]
+missing-test cmd/deadcode/main.go expected cmd/deadcode/main_test.go
+missing-test cmd/testpair/main.go expected cmd/testpair/main_test.go

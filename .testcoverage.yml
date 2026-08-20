@@ -1,0 +1,33 @@
+# Coverage enforcement via go-test-coverage.
+# Install: go install github.com/vladopajic/go-test-coverage/v2@latest
+# Run:     make coverage
+#
+# A threshold is set per file, per package, and for the project total.
+#
+# These are floors against backsliding, set just under what the suite reaches
+# today rather than at what it ought to reach. The thin packages are the ones
+# whose functions end in os.Exit, which a test cannot call and return from:
+# internal/tools/deadcode sets the package floor, and the paths it leaves
+# uncovered are the analyzer invocation and the three refusal messages.
+# Raising that floor means having those functions answer with a code instead
+# of spending one, which is a change to the package rather than to this file.
+
+profile: coverage.out
+
+threshold:
+  # Per-file minimum. Zero holds no single file to a floor, so a thin file is
+  # caught by the package figure it drags down.
+  file: 0
+
+  # Per-package minimum, set by internal/tools/deadcode at 26.0%.
+  package: 25
+
+  # Overall project minimum.
+  total: 60
+
+override:
+  # cmd/ holds the two single-tool entry points, each a package clause and a
+  # one-line main. The behaviour under them lives in internal/ and is held to
+  # the package figure.
+  - threshold: 0
+    path: ^cmd/

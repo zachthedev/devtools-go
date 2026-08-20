@@ -1,0 +1,170 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ///// Canonical form /////
+
+  tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: make tidy
+
+  # ///// Static analysis /////
+
+  # golangci-lint analyses one GOOS per run. This module reads paths the
+  # operating system hands it and normalises separators, so a single run
+  # would leave one separator convention analysed by nothing.
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        # Set on the step rather than the job, so the toolchain setup and its
+        # cache still resolve against the runner's own platform.
+        env:
+          GOOS: ${{ matrix.goos }}
+        with:
+          # Must be built with a Go at least as new as the one go.mod targets.
+          # An older golangci-lint refuses the config outright rather than
+          # linting what it understands.
+          version: v2.13.0
+
+  vet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: make vet
+
+  # Both tools run against this module's own source. A convention that does
+  # not hold here is one this module should not be asking of anyone else.
+  selfcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: make testpair
+      # The reachability analysis comes from x/tools and ships as its own
+      # binary, built separately from the toolchain that builds this module.
+      # Pinned to the version the Makefile names, so CI and a workstation
+      # run the same analysis rather than whichever was newest that morning.
+      - run: go install golang.org/x/tools/cmd/deadcode@v0.48.0
+      - run: make deadcode
+
+  # ///// Security /////
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - run: make vulncheck
+
+  # ///// Behavior /////
+
+  # Windows is the case this module is most likely to get wrong: it parses
+  # analyser output holding backslashes and resolves package directories
+  # against a drive-lettered working directory. Go is invoked directly here
+  # rather than through make, which the Windows runner does not carry.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...
+
+  coverage:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # These jobs build and run pull-request code, and none of them
+          # needs the token after checkout.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go install github.com/vladopajic/go-test-coverage/v2@v2.18.4
+      - run: make coverage
+
+  # ///// Aggregate /////
+
+  # One status for branch protection to require, so a job added above is
+  # covered without editing the protection rule.
+  check:
+    if: always()
+    needs: [tidy, lint, vet, selfcheck, vulncheck, test, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
+        with:
+          jobs: ${{ toJSON(needs) }}

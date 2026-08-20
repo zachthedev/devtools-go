@@ -1,0 +1,12 @@
+# Deadcode allow list.
+# Every entry must have a # [category] comment above its group.
+# Entries without a category tag will fail the check.
+#
+# Regenerate: go tool deadcode update
+#
+# Categories:
+#   [public-api]  exported API not yet called from cmd/
+#   [test-only]  called from _test.go files; deadcode cannot trace test imports
+#   [platform]  platform-specific code not built on current OS
+#   [scaffold]  framework wiring for future use
+

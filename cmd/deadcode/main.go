@@ -1,7 +1,12 @@
-// Deadcode is a single-tool entry point for the unreachable-function check.
-// Use this when your repo only needs one devtool and you'd rather
-// invoke `go tool deadcode` than `go tool devtools deadcode`.
-// The meta-dispatcher at ./cmd/devtools exposes the same tool.
+// Deadcode reports exported symbols that no main package can reach, and
+// compares them against .allow.deadcode.
+//
+// The reachability analysis comes from golang.org/x/tools/cmd/deadcode.
+// This wraps it with the allow list, the category rules, and the exit
+// codes, and refuses to run without it rather than reporting an empty
+// result.
+//
+// Declare it as a tool dependency to invoke it as `go tool deadcode`.
 package main
 
 import (

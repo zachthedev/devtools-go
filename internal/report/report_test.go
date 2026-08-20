@@ -96,14 +96,14 @@ func TestPrintRemoved(t *testing.T) {
 	var buf bytes.Buffer
 	PrintRemoved(&buf, []Finding{
 		{Kind: "missing-test", File: "a.go", Detail: "x"},
-	}, ".allow.testpair", "go tool devtools testpair update")
+	}, ".allow.testpair", "go tool testpair update")
 	got := buf.String()
 	for _, want := range []string{
 		"1 allow-list entry",
 		"is no longer",
 		".allow.testpair",
 		"a.go",
-		"go tool devtools testpair update",
+		"go tool testpair update",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("PrintRemoved output missing %q:\n%s", want, got)

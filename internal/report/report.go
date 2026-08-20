@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/fatih/color"
@@ -95,9 +96,9 @@ func PrintFindings(w io.Writer, findings []Finding, allowFile string) {
 // longer findings. updateCmd is the invocation users should run to
 // regenerate the allow file.
 func PrintRemoved(w io.Writer, removed []Finding, allowFile, updateCmd string) {
-	fmt.Fprintf(w, "%s in %s %s no longer findings:\n\n",
+	fmt.Fprintf(w, "%s in %s %s:\n\n",
 		Count(len(removed), "allow-list entry", "allow-list entries"),
-		allowFile, verbBe(len(removed)))
+		allowFile, staleClause(len(removed)))
 	writeTable(w, removed, "")
 	fmt.Fprintf(w, "\nRun %s to shrink the allow list.\n", bold(updateCmd))
 }
@@ -110,12 +111,12 @@ func PrintUpdated(w io.Writer, count int, allowFile string) {
 // PrintUncategorized writes the FAIL block for allow-list entries lacking
 // a category tag.
 func PrintUncategorized(w io.Writer, entries []string, allowFile string) {
-	fmt.Fprintf(w, "%s %s in %s have no [category] tag:\n\n",
+	fmt.Fprintf(w, "%s %s in %s %s no [category] tag:\n\n",
 		red(bold("FAIL:")),
 		Count(len(entries), "allow-list entry", "allow-list entries"),
-		allowFile)
+		allowFile, verbHave(len(entries)))
 	for _, line := range entries {
-		fmt.Fprintf(w, "  %s\n", line)
+		fmt.Fprintf(w, "  %s\n", field(line))
 	}
 	fmt.Fprintf(w, "\nEvery entry needs a %s comment above its group.\n",
 		bold("# [category]"))
@@ -133,10 +134,10 @@ func PrintDiff(w io.Writer, newFindings, removed []Finding, allowFile, updateCmd
 
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, f := range newFindings {
-		fmt.Fprintf(tw, "%s\t[%s]\t%s\t%s\n", green("+"), f.Kind, f.File, f.Detail)
+		fmt.Fprintf(tw, "%s\t[%s]\t%s\t%s\n", green("+"), field(f.Kind), field(f.File), field(f.Detail))
 	}
 	for _, f := range removed {
-		fmt.Fprintf(tw, "%s\t[%s]\t%s\t%s\n", yellow("-"), f.Kind, f.File, f.Detail)
+		fmt.Fprintf(tw, "%s\t[%s]\t%s\t%s\n", yellow("-"), field(f.Kind), field(f.File), field(f.Detail))
 	}
 	_ = tw.Flush()
 
@@ -208,20 +209,89 @@ func OpenJSONOutput(path string) (io.Writer, func()) {
 func writeTable(w io.Writer, findings []Finding, prefix string) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, f := range findings {
+		kind, file, detail := field(f.Kind), field(f.File), field(f.Detail)
 		if prefix == "" {
-			fmt.Fprintf(tw, "  [%s]\t%s\t%s\n", f.Kind, f.File, f.Detail)
+			fmt.Fprintf(tw, "  [%s]\t%s\t%s\n", kind, file, detail)
 		} else {
-			fmt.Fprintf(tw, "  %s\t[%s]\t%s\t%s\n", prefix, f.Kind, f.File, f.Detail)
+			fmt.Fprintf(tw, "  %s\t[%s]\t%s\t%s\n", prefix, kind, file, detail)
 		}
 	}
 	_ = tw.Flush()
 }
 
-// verbBe returns "is" for n == 1 and "are" otherwise, for constructing
-// grammatically agreeing sentences.
-func verbBe(n int) string {
-	if n == 1 {
-		return "is"
+// field renders one table cell, escaping every control character.
+//
+// A finding carries text from an analyzer and a path from the repository,
+// and a pull request controls both. Printed raw, an escape sequence erases
+// the row it sits on and redraws it as whatever the author chose, so a
+// failing check can be made to read as a passing one. A tab is escaped for
+// the duller reason that it would split the cell.
+func field(s string) string {
+	return escape(s, false)
+}
+
+// Block renders untrusted multi-line text for a stderr echo, escaping
+// every control character except the newlines that give it its shape.
+func Block(s string) string {
+	return escape(s, true)
+}
+
+// escape replaces control characters with a readable \xNN form, optionally
+// keeping newlines so a multi-line quote still reads as one.
+func escape(s string, keepNewlines bool) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return control(r, keepNewlines) }) {
+		return s
 	}
-	return "are"
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if control(r, keepNewlines) {
+			fmt.Fprintf(&b, `\x%02x`, r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// control reports whether a rune would move the cursor rather than print.
+func control(r rune, keepNewlines bool) bool {
+	if keepNewlines && r == '\n' {
+		return false
+	}
+	return r < 0x20 || r == 0x7f
+}
+
+// PrintMalformed writes the FAIL block for allow-file lines a tool cannot
+// parse, and is the counterpart to refusing unreadable analyzer output.
+// Skipping such a line would shrink the allow list without saying so, and
+// the reported exception count would then disagree with the file.
+func PrintMalformed(w io.Writer, lines []string, allowFile string) {
+	fmt.Fprintf(w, "%s %s in %s cannot be parsed:\n\n",
+		red(bold("FAIL:")),
+		Count(len(lines), "line", ""),
+		allowFile)
+	for _, line := range lines {
+		fmt.Fprintf(w, "  %s\n", field(line))
+	}
+	fmt.Fprintf(w, "\nEvery entry must match the shape this tool writes.\n")
+}
+
+// verbHave returns "has" for n == 1 and "have" otherwise, for constructing
+// grammatically agreeing sentences.
+func verbHave(n int) string {
+	if n == 1 {
+		return "has"
+	}
+	return "have"
+}
+
+// staleClause completes a sentence about entries that stopped being
+// findings. The noun agrees along with the verb, so one entry is no longer
+// a finding rather than no longer findings.
+func staleClause(n int) string {
+	if n == 1 {
+		return "is no longer a finding"
+	}
+	return "are no longer findings"
 }
